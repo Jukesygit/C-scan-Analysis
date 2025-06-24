@@ -1,0 +1,5 @@
+nicegui
+numpy
+pandas
+matplotlib
+scipy
