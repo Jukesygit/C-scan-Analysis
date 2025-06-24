@@ -26,6 +26,10 @@ from nicegui import ui, app
 from nicegui.events import UploadEventArguments
 import matplotlib
 matplotlib.use('Agg')  # Use non-interactive backend for web
+import matplotlib.patches as patches
+from matplotlib.patches import Rectangle, FancyBboxPatch
+from matplotlib.patches import FancyArrowPatch
+import matplotlib.pyplot as plt
 
 # Import all the original analysis functions
 from typing import Optional, Tuple, List, Dict, Any
@@ -43,7 +47,10 @@ app_state = {
     'x_offset': 0,
     'y_offset': 0,
     'csv_file': None, # To store uploaded CSV
-    'cscan_files': [] # To store uploaded C-Scan files
+    'cscan_files': [], # To store uploaded C-Scan files
+    'current_scan_name': '', # Name of current scan/composite
+    'zoom_region': None, # (x1, y1, x2, y2) for zoom/crop
+    'annotations': [] # List of annotations
 }
 
 # --- Settings and Data Paths ---
@@ -261,8 +268,8 @@ def build_composite(csv_path, cscan_folder, colourised, strake_filter, flip_scan
     return composite, overall_min, overall_max, mapped_files, missing_scans, x_offset, y_offset
 
 
-def plot_to_base64(composite, min_val, max_val, colourised, x_offset, y_offset):
-    """Convert matplotlib plot to base64 string for web display"""
+def plot_to_base64(composite, min_val, max_val, colourised, x_offset, y_offset, title="C-Scan Visualization"):
+    """Convert matplotlib plot to base64 string for web display with annotations"""
     fig, ax = plt.subplots(figsize=(16, 9), facecolor='#00000000')
     ax.set_facecolor('#111111DD')
 
@@ -277,15 +284,51 @@ def plot_to_base64(composite, min_val, max_val, colourised, x_offset, y_offset):
             cmap = LinearSegmentedColormap.from_list("custom_cmap", list(zip(positions, colors)))
 
         height, width = composite.shape
-        extent = [-x_offset, width - x_offset, -y_offset, height - y_offset]
         
-        im = ax.imshow(composite, cmap=cmap, origin='lower', vmin=min_val, vmax=max_val, aspect='equal', extent=extent)
+        # Apply zoom/crop if specified
+        zoom_region = app_state.get('zoom_region')
+        if zoom_region:
+            x1, y1, x2, y2 = zoom_region
+            # Ensure coordinates are within bounds
+            x1 = max(0, min(x1, width))
+            x2 = max(0, min(x2, width))
+            y1 = max(0, min(y1, height))
+            y2 = max(0, min(y2, height))
+            
+            # Crop the data
+            composite_cropped = composite[y1:y2, x1:x2]
+            extent = [x1 - x_offset, x2 - x_offset, y1 - y_offset, y2 - y_offset]
+        else:
+            composite_cropped = composite
+            extent = [-x_offset, width - x_offset, -y_offset, height - y_offset]
+        
+        im = ax.imshow(composite_cropped, cmap=cmap, origin='lower', vmin=min_val, vmax=max_val, aspect='equal', extent=extent)
+        
+        # Add annotations
+        for annotation in app_state.get('annotations', []):
+            ann_type = annotation['type']
+            if ann_type == 'text':
+                ax.text(annotation['x'], annotation['y'], annotation['text'], 
+                       color=annotation.get('color', 'white'), fontsize=annotation.get('size', 12),
+                       bbox=dict(boxstyle="round,pad=0.3", facecolor='black', alpha=0.7))
+            elif ann_type == 'arrow':
+                arrow = FancyArrowPatch((annotation['x1'], annotation['y1']), 
+                                      (annotation['x2'], annotation['y2']),
+                                      arrowstyle='->', mutation_scale=20, 
+                                      color=annotation.get('color', 'red'), linewidth=2)
+                ax.add_patch(arrow)
+            elif ann_type == 'rectangle':
+                rect = Rectangle((annotation['x'], annotation['y']), 
+                               annotation['width'], annotation['height'],
+                               linewidth=2, edgecolor=annotation.get('color', 'yellow'), 
+                               facecolor='none', linestyle='--')
+                ax.add_patch(rect)
         
         cbar = plt.colorbar(im, ax=ax)
         cbar.set_label("Thickness (mm)", color='white')
         plt.setp(plt.getp(cbar.ax.axes, 'yticklabels'), color='white')
 
-        ax.set_title("Composite C-Scan Heatmap", color='white')
+        ax.set_title(title, color='white', fontsize=16, pad=20)
         ax.set_xlabel("X (mm)", color='white')
         ax.set_ylabel("Y (mm)", color='white')
         ax.tick_params(axis='x', colors='white')
@@ -296,7 +339,7 @@ def plot_to_base64(composite, min_val, max_val, colourised, x_offset, y_offset):
     plt.tight_layout()
     
     buffer = BytesIO()
-    plt.savefig(buffer, format='png', dpi=150, transparent=True)
+    plt.savefig(buffer, format='png', dpi=150, transparent=True, bbox_inches='tight')
     plt.close(fig)
     return base64.b64encode(buffer.getvalue()).decode('utf-8')
 
@@ -410,14 +453,14 @@ async def build_composite_action():
         
         app_state.update({
             'composite': composite, 'vmin': vmin, 'vmax': vmax,
-            'x_offset': x_off, 'y_offset': y_off
+            'x_offset': x_off, 'y_offset': y_off, 'current_scan_name': 'Composite Analysis'
         })
 
         min_thick = min_thickness_input.value or vmin
         max_thick = max_thickness_input.value or vmax
         
         plot_base64 = await asyncio.to_thread(
-            plot_to_base64, composite, min_thick, max_thick, colourised_switch.value, x_off, y_off
+            plot_to_base64, composite, min_thick, max_thick, colourised_switch.value, x_off, y_off, "Composite C-Scan Analysis"
         )
         
         update_progress(1.0, "Complete!")
@@ -427,6 +470,7 @@ async def build_composite_action():
         result_image_display.set_source(f'data:image/png;base64,{plot_base64}')
         result_placeholder.set_visibility(False)
         result_image_display.set_visibility(True)
+        current_scan_label.set_text("📊 Composite Analysis - Use controls below to zoom, annotate, and export")
 
         log_text = (
             f"✅ Success! Mapped {len(mapped_files)}/{len(mapped_files) + len(missing)} scans.\n"
@@ -518,32 +562,30 @@ async def process_single_scan_action(e: UploadEventArguments):
             vmin, vmax = np.nanmin(mat), np.nanmax(mat)
             
             # For a single scan, offsets are 0
-            x_offset, y_offset = 0, 0
-
-            # Update app_state so "Save As Image" can work
+            x_offset, y_offset = 0, 0            # Update app_state so "Save As Image" can work
             app_state.update({
                 'composite': mat,
                 'vmin': vmin,
                 'vmax': vmax,
                 'x_offset': x_offset,
-                'y_offset': y_offset
+                'y_offset': y_offset,
+                'current_scan_name': f'Single Scan: {e.name}'
             })
             
             min_thick = min_thickness_input.value or vmin
             max_thick = max_thickness_input.value or vmax
             colourised = colourised_switch.value
 
-            plot_base64 = plot_to_base64(mat, min_thick, max_thick, colourised, x_offset, y_offset)
+            plot_base64 = plot_to_base64(mat, min_thick, max_thick, colourised, x_offset, y_offset, f"Single Scan: {e.name}")
             return plot_base64, mat, vmin, vmax
 
         plot_base64, mat, vmin, vmax = await asyncio.to_thread(process_and_plot)
 
-        progress_dialog.close()
-
-        # Update UI
+        progress_dialog.close()        # Update UI
         result_image_display.set_source(f'data:image/png;base64,{plot_base64}')
         result_placeholder.set_visibility(False)
         result_image_display.set_visibility(True)
+        current_scan_label.set_text(f"🔍 Single Scan: {e.name} - Use controls below to zoom, annotate, and export")
 
         log_text = (
             f"✅ Success! Loaded single scan: {e.name}\n"
@@ -559,6 +601,268 @@ async def process_single_scan_action(e: UploadEventArguments):
         ui.notify(f"An error occurred: {ex}", type='negative', multi_line=True, classes='multi-line-notification')
         result_placeholder.set_visibility(True)
         result_image_display.set_visibility(False)
+
+
+# --- Annotation and Zoom Functions ---
+def add_text_annotation():
+    """Add a text annotation to the current visualization"""
+    if app_state['composite'] is None:
+        ui.notify("Please load a scan first.", type='warning')
+        return
+    
+    def add_annotation(x, y, text, color, size):
+        app_state['annotations'].append({
+            'type': 'text',
+            'x': float(x),
+            'y': float(y), 
+            'text': text,
+            'color': color,
+            'size': int(size)
+        })
+        refresh_visualization()
+        annotation_dialog.close()
+    
+    with ui.dialog() as annotation_dialog:
+        with ui.card().classes('glass-card'):
+            ui.label('Add Text Annotation').classes('text-lg font-semibold')
+            x_input = ui.number('X Position', value=0).props('dark')
+            y_input = ui.number('Y Position', value=0).props('dark')
+            text_input = ui.input('Text').props('dark')
+            color_input = ui.select(['white', 'red', 'yellow', 'green', 'blue', 'cyan'], value='white', label='Color').props('dark')
+            size_input = ui.number('Font Size', value=12, min=8, max=24).props('dark')
+            
+            with ui.row():
+                ui.button('Add', on_click=lambda: add_annotation(
+                    x_input.value, y_input.value, text_input.value, 
+                    color_input.value, size_input.value
+                )).classes('neon-button')
+                ui.button('Cancel', on_click=annotation_dialog.close).props('flat')
+    
+    annotation_dialog.open()
+
+def add_arrow_annotation():
+    """Add an arrow annotation to the current visualization"""
+    if app_state['composite'] is None:
+        ui.notify("Please load a scan first.", type='warning')
+        return
+    
+    def add_annotation(x1, y1, x2, y2, color):
+        app_state['annotations'].append({
+            'type': 'arrow',
+            'x1': float(x1),
+            'y1': float(y1),
+            'x2': float(x2),
+            'y2': float(y2),
+            'color': color
+        })
+        refresh_visualization()
+        annotation_dialog.close()
+    
+    with ui.dialog() as annotation_dialog:
+        with ui.card().classes('glass-card'):
+            ui.label('Add Arrow Annotation').classes('text-lg font-semibold')
+            x1_input = ui.number('Start X', value=0).props('dark')
+            y1_input = ui.number('Start Y', value=0).props('dark')
+            x2_input = ui.number('End X', value=50).props('dark')
+            y2_input = ui.number('End Y', value=50).props('dark')
+            color_input = ui.select(['red', 'yellow', 'green', 'blue', 'cyan', 'white'], value='red', label='Color').props('dark')
+            
+            with ui.row():
+                ui.button('Add', on_click=lambda: add_annotation(
+                    x1_input.value, y1_input.value, x2_input.value, 
+                    y2_input.value, color_input.value
+                )).classes('neon-button')
+                ui.button('Cancel', on_click=annotation_dialog.close).props('flat')
+    
+    annotation_dialog.open()
+
+def add_rectangle_annotation():
+    """Add a rectangle annotation to the current visualization"""
+    if app_state['composite'] is None:
+        ui.notify("Please load a scan first.", type='warning')
+        return
+    
+    def add_annotation(x, y, width, height, color):
+        app_state['annotations'].append({
+            'type': 'rectangle',
+            'x': float(x),
+            'y': float(y),
+            'width': float(width),
+            'height': float(height),
+            'color': color
+        })
+        refresh_visualization()
+        annotation_dialog.close()
+    
+    with ui.dialog() as annotation_dialog:
+        with ui.card().classes('glass-card'):
+            ui.label('Add Rectangle Annotation').classes('text-lg font-semibold')
+            x_input = ui.number('X Position', value=0).props('dark')
+            y_input = ui.number('Y Position', value=0).props('dark')
+            width_input = ui.number('Width', value=50).props('dark')
+            height_input = ui.number('Height', value=50).props('dark')
+            color_input = ui.select(['yellow', 'red', 'green', 'blue', 'cyan', 'white'], value='yellow', label='Color').props('dark')
+            
+            with ui.row():
+                ui.button('Add', on_click=lambda: add_annotation(
+                    x_input.value, y_input.value, width_input.value, 
+                    height_input.value, color_input.value
+                )).classes('neon-button')
+                ui.button('Cancel', on_click=annotation_dialog.close).props('flat')
+    
+    annotation_dialog.open()
+
+def set_zoom_region():
+    """Set a zoom/crop region for the visualization"""
+    if app_state['composite'] is None:
+        ui.notify("Please load a scan first.", type='warning')
+        return
+    
+    def apply_zoom(x1, y1, x2, y2):
+        app_state['zoom_region'] = (int(x1), int(y1), int(x2), int(y2))
+        refresh_visualization()
+        zoom_dialog.close()
+        ui.notify("Zoom region applied. Use 'Reset View' to return to full view.", type='positive')
+    
+    with ui.dialog() as zoom_dialog:
+        with ui.card().classes('glass-card'):
+            ui.label('Set Zoom/Crop Region').classes('text-lg font-semibold')
+            ui.label('Define the rectangular region to zoom into (in pixels):').classes('text-sm text-gray-400')
+            x1_input = ui.number('Left (X1)', value=0, min=0).props('dark')
+            y1_input = ui.number('Bottom (Y1)', value=0, min=0).props('dark')
+            x2_input = ui.number('Right (X2)', value=100, min=0).props('dark')
+            y2_input = ui.number('Top (Y2)', value=100, min=0).props('dark')
+            
+            with ui.row():
+                ui.button('Apply Zoom', on_click=lambda: apply_zoom(
+                    x1_input.value, y1_input.value, x2_input.value, y2_input.value
+                )).classes('neon-button')
+                ui.button('Cancel', on_click=zoom_dialog.close).props('flat')
+    
+    zoom_dialog.open()
+
+def reset_view():
+    """Reset the view to show the full scan without zoom or annotations"""
+    app_state['zoom_region'] = None
+    refresh_visualization()
+    ui.notify("View reset to full scan.", type='positive')
+
+def clear_annotations():
+    """Clear all annotations from the current visualization"""
+    app_state['annotations'] = []
+    refresh_visualization()
+    ui.notify("All annotations cleared.", type='positive')
+
+def refresh_visualization():
+    """Refresh the current visualization with updated annotations/zoom"""
+    if app_state['composite'] is None:
+        return
+    
+    try:
+        composite = app_state['composite']
+        min_val = min_thickness_input.value or app_state['vmin']
+        max_val = max_thickness_input.value or app_state['vmax']
+        title = app_state.get('current_scan_name', 'C-Scan Visualization')
+        
+        plot_base64 = plot_to_base64(
+            composite, min_val, max_val, colourised_switch.value, 
+            app_state['x_offset'], app_state['y_offset'], title
+        )
+        
+        result_image_display.set_source(f'data:image/png;base64,{plot_base64}')
+        result_placeholder.set_visibility(False)
+        result_image_display.set_visibility(True)
+        
+    except Exception as e:
+        ui.notify(f"Error refreshing visualization: {e}", type='negative')
+
+
+async def export_enhanced_image():
+    """Export the current visualization with all annotations and zoom settings"""
+    if app_state['composite'] is None:
+        ui.notify("Please build a composite or load a single scan first.", type='warning')
+        return
+        
+    ui.notify("Generating enhanced export... please wait.", type='ongoing')
+    
+    try:
+        composite = app_state['composite']
+        min_val = min_thickness_input.value or app_state['vmin']
+        max_val = max_thickness_input.value or app_state['vmax']
+        title = app_state.get('current_scan_name', 'C-Scan Analysis')
+        
+        # Create high-resolution export
+        fig, ax = plt.subplots(figsize=(20, 12))
+        
+        # Apply zoom/crop if specified
+        zoom_region = app_state.get('zoom_region')
+        if zoom_region:
+            x1, y1, x2, y2 = zoom_region
+            height, width = composite.shape
+            x1 = max(0, min(x1, width))
+            x2 = max(0, min(x2, width))
+            y1 = max(0, min(y1, height))
+            y2 = max(0, min(y2, height))
+            composite_cropped = composite[y1:y2, x1:x2]
+            extent = [x1 - app_state['x_offset'], x2 - app_state['x_offset'], 
+                     y1 - app_state['y_offset'], y2 - app_state['y_offset']]
+        else:
+            composite_cropped = composite
+            height, width = composite.shape
+            extent = [-app_state['x_offset'], width - app_state['x_offset'], 
+                     -app_state['y_offset'], height - app_state['y_offset']]
+        
+        # Set up colormap
+        cmap = "gray"
+        if colourised_switch.value:
+            colors = [(1, 0, 0), (1, 1, 0), (0, 1, 0), (0, 0, 1)]
+            positions = [0.0, 0.33, 0.66, 1.0]
+            cmap = LinearSegmentedColormap.from_list("custom_cmap", list(zip(positions, colors)))
+        
+        im = ax.imshow(composite_cropped, cmap=cmap, origin='lower', 
+                      vmin=min_val, vmax=max_val, aspect='equal', extent=extent)
+        
+        # Add all annotations
+        for annotation in app_state.get('annotations', []):
+            ann_type = annotation['type']
+            if ann_type == 'text':
+                ax.text(annotation['x'], annotation['y'], annotation['text'], 
+                       color=annotation.get('color', 'white'), fontsize=annotation.get('size', 14),
+                       bbox=dict(boxstyle="round,pad=0.3", facecolor='black', alpha=0.8))
+            elif ann_type == 'arrow':
+                arrow = FancyArrowPatch((annotation['x1'], annotation['y1']), 
+                                      (annotation['x2'], annotation['y2']),
+                                      arrowstyle='->', mutation_scale=25, 
+                                      color=annotation.get('color', 'red'), linewidth=3)
+                ax.add_patch(arrow)
+            elif ann_type == 'rectangle':
+                rect = Rectangle((annotation['x'], annotation['y']), 
+                               annotation['width'], annotation['height'],
+                               linewidth=3, edgecolor=annotation.get('color', 'yellow'), 
+                               facecolor='none', linestyle='--')
+                ax.add_patch(rect)
+        
+        plt.colorbar(im, label="Thickness (mm)")
+        plt.title(title, fontsize=18, pad=20)
+        plt.xlabel("X (mm)", fontsize=14)
+        plt.ylabel("Y (mm)", fontsize=14)
+        plt.tight_layout()
+        
+        buffer = BytesIO()
+        await asyncio.to_thread(plt.savefig, buffer, format='png', dpi=300, bbox_inches='tight')
+        plt.close(fig)
+        buffer.seek(0)
+        
+        # Generate filename with timestamp
+        import datetime
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f'cscan_enhanced_{timestamp}.png'
+        
+        ui.download(buffer.getvalue(), filename, 'image/png')
+        ui.notify(f"Enhanced image exported as {filename}", type='positive')
+        
+    except Exception as e:
+        ui.notify(f"Error creating enhanced export: {e}", type='negative')
 
 
 # --- UI Definition ---
@@ -619,9 +923,8 @@ def main_page():
 
     # The main layout is a full-screen row that doesn't wrap.
     with ui.row().classes('w-full h-screen p-0 m-0 no-wrap'):
-        
-        # --- LEFT SIDEBAR (FIXED WIDTH) ---
-        with ui.column().classes('w-[450px] min-w-[450px] h-full p-6 space-y-6 overflow-y-auto flex-shrink-0'):
+          # --- LEFT SIDEBAR (FIXED WIDTH) ---
+        with ui.column().classes('w-[480px] min-w-[480px] h-full p-6 space-y-4 overflow-y-auto flex-shrink-0'):
             ui.label('C-Scan Composite Analysis').classes('text-3xl font-bold text-white')
             ui.badge('v3.0-stable', color='positive').classes('w-fit')
 
@@ -660,27 +963,57 @@ def main_page():
                         max_thickness_input = ui.number('Max Thickness', value=last_max, format='%.2f').props('dark').classes('w-full')
                     
                     area_filter_input = ui.input('Area Filter (e.g., strake 1)').props('dark').classes('w-full')
-            
-            # Operations Card
+              # Operations Card
             with ui.card().classes('glass-card w-full'):
+                with ui.card_section():
+                    ui.label('Main Operations').classes('text-lg font-semibold')
                 with ui.card_section().classes('space-y-3'):
                     ui.button('Build Composite', icon='build', on_click=build_composite_action).classes('w-full neon-button h-12')
                     ui.button('Download Image', icon='download', on_click=save_composite).classes('w-full')
                     with ui.upload(label='Process Single Scan', on_upload=process_single_scan_action, auto_upload=True).props('dark').classes('w-full'):
                          ui.button('Process Single Scan', icon='image_search').classes('w-full')
+            
+            # Visualization Controls Card
+            with ui.card().classes('glass-card w-full'):
+                with ui.card_section():
+                    ui.label('Visualization Controls').classes('text-lg font-semibold')
+                with ui.card_section().classes('space-y-2'):
+                    ui.button('Refresh View', icon='refresh', on_click=refresh_visualization).classes('w-full')
+                    ui.button('Zoom/Crop Region', icon='crop', on_click=set_zoom_region).classes('w-full')
+                    ui.button('Reset View', icon='zoom_out_map', on_click=reset_view).classes('w-full')
+                    
+            # Annotation Tools Card
+            with ui.card().classes('glass-card w-full'):
+                with ui.card_section():
+                    ui.label('Annotation Tools').classes('text-lg font-semibold')
+                with ui.card_section().classes('space-y-2'):
+                    ui.button('Add Text', icon='text_fields', on_click=add_text_annotation).classes('w-full')
+                    ui.button('Add Arrow', icon='arrow_forward', on_click=add_arrow_annotation).classes('w-full')
+                    ui.button('Add Rectangle', icon='crop_free', on_click=add_rectangle_annotation).classes('w-full')
+                    ui.button('Clear Annotations', icon='clear', on_click=clear_annotations).props('color=orange').classes('w-full')
+                    
+            # Enhanced Export Card
+            with ui.card().classes('glass-card w-full'):
+                with ui.card_section():
+                    ui.label('Export Options').classes('text-lg font-semibold')
+                with ui.card_section().classes('space-y-2'):
+                    ui.button('Export Enhanced Image', icon='photo_camera', on_click=export_enhanced_image).classes('w-full neon-button')
+                    ui.label('High-res export with annotations').classes('text-xs text-gray-400')
 
         # --- RIGHT CONTENT AREA (FLEXIBLE WIDTH) ---
         with ui.column().classes('flex-grow h-full p-6 space-y-6 overflow-y-auto'):
-            
-            # Results Visualization Card
+              # Results Visualization Card
             with ui.card().classes('glass-card w-full h-3/5'):
                 with ui.card_section():
-                    ui.label('Composite Visualization').classes('text-lg font-semibold')
+                    ui.label('Interactive Visualization').classes('text-lg font-semibold')
+                    global current_scan_label
+                    current_scan_label = ui.label('Load a scan to begin visualization').classes('text-sm text-gray-400')
                 with ui.card_section().classes('w-full h-full'):
                     global result_placeholder, result_image_display
                     with ui.column().classes('w-full h-full justify-center items-center text-center') as result_placeholder:
                         ui.icon('analytics', size='6rem').classes('text-gray-500')
-                        ui.label('Build a composite to see results here').classes('text-gray-400 font-semibold')
+                        ui.label('Build a composite or process a single scan').classes('text-gray-400 font-semibold')
+                        ui.label('Use visualization controls for zoom, annotations, and export').classes('text-xs text-gray-500')
                     
                     result_image_display = ui.image().classes('w-full h-full object-contain rounded-lg').set_visibility(False)
 
