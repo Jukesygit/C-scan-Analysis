@@ -23,6 +23,7 @@ import shutil
 # from tkinter import filedialog, Tk # No longer needed for web deployment
 
 from nicegui import ui, app
+from nicegui.events import UploadEventArguments
 import matplotlib
 matplotlib.use('Agg')  # Use non-interactive backend for web
 
@@ -327,7 +328,7 @@ def save_settings(csv_path, cscan_folder, min_thickness, max_thickness):
 
 
 # --- UI Callbacks ---
-def handle_csv_upload(e: ui.events.UploadEventArguments):
+def handle_csv_upload(e: UploadEventArguments):
     """Handle the upload of the CSV file."""
     app_state['csv_file'] = {
         'name': e.name,
@@ -336,7 +337,7 @@ def handle_csv_upload(e: ui.events.UploadEventArguments):
     csv_upload_label.set_text(f"✔️ {e.name}")
     ui.notify(f"Loaded '{e.name}' as the scan log.", type='positive')
 
-def handle_cscan_upload(e: ui.events.UploadEventArguments):
+def handle_cscan_upload(e: UploadEventArguments):
     """Handle the upload of C-scan data files."""
     app_state['cscan_files'].append({
         'name': e.name,
@@ -493,7 +494,7 @@ async def save_composite():
     except Exception as e:
         ui.notify(f"Error creating download: {e}", type='negative')
 
-async def process_single_scan_action(e: ui.events.UploadEventArguments):
+async def process_single_scan_action(e: UploadEventArguments):
     """Select and process a single C-scan file from an upload."""
     if not e.content:
         ui.notify("No file selected or file is empty.", type='warning')
@@ -694,13 +695,14 @@ def main_page():
 
 # --- Application Entry Point ---
 if __name__ in {"__main__", "__mp_main__"}:
+    # Get port from environment variable (for cloud deployment) or use default
+    port = int(os.environ.get('PORT', 8080))
+    
     ui.run(
         title='C-Scan Composite Analysis',
         favicon='🔬',
         dark=True,
-        # The host and port will be set by the cloud provider,
-        # but these are good defaults for local testing.
         host='0.0.0.0',
-        port=8080,
+        port=port,
         reload=False
     )
